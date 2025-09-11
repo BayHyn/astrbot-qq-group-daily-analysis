@@ -6,6 +6,7 @@ LLM分析器模块
 import json
 import re
 from datetime import datetime
+import asyncio
 from typing import List, Dict, Tuple
 from astrbot.api import logger
 from ...src.models.data_models import SummaryTopic, UserTitle, GoldenQuote, TokenUsage
@@ -17,6 +18,82 @@ class LLMAnalyzer:
     def __init__(self, context, config_manager):
         self.context = context
         self.config_manager = config_manager
+
+    async def _call_provider_with_retry(self, provider, prompt: str, max_tokens: int, temperature: float):
+        """调用LLM提供者，带超时、重试与退避。支持自定义服务商。"""
+        timeout = self.config_manager.get_llm_timeout()
+        retries = self.config_manager.get_llm_retries()
+        backoff = self.config_manager.get_llm_backoff()
+
+        # 获取自定义服务商参数
+        custom_api_key = self.config_manager.get_custom_api_key()
+        custom_api_base = self.config_manager.get_custom_api_base_url()
+        custom_model = self.config_manager.get_custom_model_name()
+
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                if custom_api_key and custom_api_base and custom_model:
+                    logger.info(f"使用自定义LLM提供商: {custom_api_base} model={custom_model}")
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        headers = {
+                            "Authorization": f"Bearer {custom_api_key}",
+                            "Content-Type": "application/json"
+                        }
+                        payload = {
+                            "model": custom_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": max_tokens,
+                            "temperature": temperature
+                        }
+                        aio_timeout = aiohttp.ClientTimeout(total=timeout)
+                        async with session.post(custom_api_base, json=payload, headers=headers, timeout=aio_timeout) as resp:
+                            if resp.status != 200:
+                                error_text = await resp.text()
+                                logger.error(f"自定义LLM服务商请求失败: HTTP {resp.status}, 内容: {error_text}")
+                            try:
+                                response_json = await resp.json()
+                            except Exception as json_err:
+                                error_text = await resp.text()
+                                logger.error(f"自定义LLM服务商响应JSON解析失败: {json_err}, 内容: {error_text}")
+                                return None
+                            # 兼容 OpenAI 格式，安全访问嵌套字段
+                            content = None
+                            try:
+                                choices = response_json.get("choices")
+                                if choices and isinstance(choices, list) and len(choices) > 0:
+                                    message = choices[0].get("message")
+                                    if message and isinstance(message, dict):
+                                        content = message.get("content")
+                                if content is None:
+                                    logger.error(f"自定义LLM响应格式异常: {response_json}")
+                                    return None
+                            except Exception as key_err:
+                                logger.error(f"自定义LLM响应结构解析失败: {key_err}, 响应内容: {response_json}")
+                                return None
+                            # 构造一个兼容原有逻辑的对象
+                            class CustomResponse:
+                                completion_text = content
+                                raw_completion = response_json
+                            return CustomResponse()
+                else:
+                    logger.info(f"使用默认LLM provider: {provider}")
+                    coro = provider.text_chat(prompt=prompt, max_tokens=max_tokens, temperature=temperature)
+                    return await asyncio.wait_for(coro, timeout=timeout)
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                logger.warning(f"LLM请求超时: 第{attempt}次, timeout={timeout}s")
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"LLM请求失败: 第{attempt}次, 错误: {last_exc}")
+            # 若非最后一次，等待退避后重试
+            if attempt < retries:
+                await asyncio.sleep(backoff * attempt)
+
+        # 最终仍失败，记录错误并返回 None 由调用方处理降级，避免抛出异常
+        logger.error(f"LLM请求全部重试失败: {last_exc}")
+        return None
 
     async def analyze_topics(self, messages: List[Dict]) -> Tuple[List[SummaryTopic], TokenUsage]:
         """使用LLM分析话题"""
@@ -108,11 +185,10 @@ class LLMAnalyzer:
                 logger.warning("未配置LLM提供商，跳过话题分析")
                 return [], TokenUsage()
 
-            response = await provider.text_chat(
-                prompt=prompt,
-                max_tokens=10000,
-                temperature=0.6
-            )
+            response = await self._call_provider_with_retry(provider, prompt, max_tokens=10000, temperature=0.6)
+            if response is None:
+                logger.error("话题分析调用LLM失败: provider返回None（重试失败）")
+                return [], TokenUsage()
 
             # 提取token使用统计
             token_usage = TokenUsage()
@@ -336,11 +412,10 @@ class LLMAnalyzer:
                 logger.warning("未配置LLM提供商，跳过用户称号分析")
                 return [], TokenUsage()
 
-            response = await provider.text_chat(
-                prompt=prompt,
-                max_tokens=1500,
-                temperature=0.5
-            )
+            response = await self._call_provider_with_retry(provider, prompt, max_tokens=1500, temperature=0.5)
+            if response is None:
+                logger.error("用户称号分析调用LLM失败: provider返回None（重试失败）")
+                return [], TokenUsage()
 
             # 提取token使用统计
             token_usage = TokenUsage()
@@ -359,14 +434,19 @@ class LLMAnalyzer:
             else:
                 result_text = str(response)
 
+            # debug日志：打印原始响应
+            logger.debug(f"用户称号分析原始响应: {result_text[:500]}...")
+
             # 尝试解析JSON
             try:
                 json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
                 if json_match:
+                    logger.debug(f"用户称号分析JSON原文: {json_match.group()[:500]}...")
                     titles_data = json.loads(json_match.group())
                     return [UserTitle(**title) for title in titles_data], token_usage
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"用户称号分析JSON解析失败: {e}")
+                logger.debug(f"原始响应: {result_text}")
 
             return [], token_usage
 
@@ -440,11 +520,10 @@ class LLMAnalyzer:
                 logger.warning("未配置LLM提供商，跳过金句分析")
                 return [], TokenUsage()
 
-            response = await provider.text_chat(
-                prompt=prompt,
-                max_tokens=1500,
-                temperature=0.7
-            )
+            response = await self._call_provider_with_retry(provider, prompt, max_tokens=1500, temperature=0.7)
+            if response is None:
+                logger.error("金句分析调用LLM失败: provider返回None（重试失败）")
+                return [], TokenUsage()
 
             # 提取token使用统计
             token_usage = TokenUsage()
@@ -463,14 +542,19 @@ class LLMAnalyzer:
             else:
                 result_text = str(response)
 
+            # debug日志：打印原始响应
+            logger.debug(f"金句分析原始响应: {result_text[:500]}...")
+
             # 尝试解析JSON
             try:
                 json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
                 if json_match:
+                    logger.debug(f"金句分析JSON原文: {json_match.group()[:500]}...")
                     quotes_data = json.loads(json_match.group())
                     return [GoldenQuote(**quote) for quote in quotes_data[:max_golden_quotes]], token_usage
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"金句分析JSON解析失败: {e}")
+                logger.debug(f"原始响应: {result_text}")
 
             return [], token_usage
 
