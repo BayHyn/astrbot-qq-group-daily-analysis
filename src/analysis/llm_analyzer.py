@@ -19,8 +19,22 @@ class LLMAnalyzer:
         self.context = context
         self.config_manager = config_manager
 
-    async def _call_provider_with_retry(self, provider, prompt: str, max_tokens: int, temperature: float):
-        """调用LLM提供者，带超时、重试与退避。支持自定义服务商。"""
+    async def _call_provider_with_retry(self, provider, prompt: str, max_tokens: int, temperature: float, umo: str = None):
+        """
+        调用LLM提供者，带超时、重试与退避。支持自定义服务商。
+
+        Args:
+            provider: LLM服务商实例或None。
+            prompt (str): 输入的提示语。
+            max_tokens (int): 最大生成token数。
+            temperature (float): 采样温度。
+            umo (str, optional): 指定使用的模型唯一标识符（Unique Model Object），
+                用于选择特定的LLM服务商或模型。格式通常为字符串，例如 "gpt-3.5-turbo"。
+                如果为None，则使用默认模型。
+
+        Returns:
+            LLM生成的结果。
+        """
         timeout = self.config_manager.get_llm_timeout()
         retries = self.config_manager.get_llm_retries()
         backoff = self.config_manager.get_llm_backoff()
@@ -80,9 +94,23 @@ class LLMAnalyzer:
                 else:
                     # 确保使用当前指定的模型
                     if provider is None:
-                        provider = self.context.get_using_provider()
+                        provider = self.context.get_using_provider(umo=umo)
+                        provider_id = 'unknown'
+                        if provider:
+                            try:
+                                meta = provider.meta()
+                                provider_id = meta.id
+                            except Exception as e:
+                                logger.debug(f"获取提供商ID失败: {e}")
+                        logger.info(f"获取到的 provider ID: {provider_id}")
+                        if not provider or provider_id == 'unknown':
+                            logger.warning(f"获取的提供商不正确 (Provider ID: {provider_id})")
 
+                    
                     logger.info(f"使用LLM provider: {provider}")
+                    if not provider:
+                        logger.error("provider 为空，无法调用 text_chat，直接返回 None")
+                        return None
                     coro = provider.text_chat(prompt=prompt, max_tokens=max_tokens, temperature=temperature)
                     return await asyncio.wait_for(coro, timeout=timeout)
             except asyncio.TimeoutError as e:
@@ -99,7 +127,7 @@ class LLMAnalyzer:
         logger.error(f"LLM请求全部重试失败: {last_exc}")
         return None
 
-    async def analyze_topics(self, messages: List[Dict]) -> Tuple[List[SummaryTopic], TokenUsage]:
+    async def analyze_topics(self, messages: List[Dict], umo: str = None) -> Tuple[List[SummaryTopic], TokenUsage]:
         """使用LLM分析话题"""
         try:
             # 提取文本消息
@@ -184,12 +212,7 @@ class LLMAnalyzer:
 """
 
             # 调用LLM
-            provider = self.context.get_using_provider()
-            if not provider:
-                logger.warning("未配置LLM提供商，跳过话题分析")
-                return [], TokenUsage()
-
-            response = await self._call_provider_with_retry(provider, prompt, max_tokens=10000, temperature=0.6)
+            response = await self._call_provider_with_retry(None, prompt, max_tokens=10000, temperature=0.6, umo=umo)
             if response is None:
                 logger.error("话题分析调用LLM失败: provider返回None（重试失败）")
                 return [], TokenUsage()
@@ -340,7 +363,7 @@ class LLMAnalyzer:
             logger.error(f"正则表达式提取失败: {e}")
             return []
 
-    async def analyze_user_titles(self, messages: List[Dict], user_analysis: Dict) -> Tuple[List[UserTitle], TokenUsage]:
+    async def analyze_user_titles(self, messages: List[Dict], user_analysis: Dict, umo: str = None) -> Tuple[List[UserTitle], TokenUsage]:
         """使用LLM分析用户称号"""
         try:
             # 准备用户数据
@@ -411,12 +434,7 @@ class LLMAnalyzer:
 """
 
             # 调用LLM
-            provider = self.context.get_using_provider()
-            if not provider:
-                logger.warning("未配置LLM提供商，跳过用户称号分析")
-                return [], TokenUsage()
-
-            response = await self._call_provider_with_retry(provider, prompt, max_tokens=1500, temperature=0.5)
+            response = await self._call_provider_with_retry(None, prompt, max_tokens=1500, temperature=0.5, umo=umo)
             if response is None:
                 logger.error("用户称号分析调用LLM失败: provider返回None（重试失败）")
                 return [], TokenUsage()
@@ -458,7 +476,7 @@ class LLMAnalyzer:
             logger.error(f"用户称号分析失败: {e}")
             return [], TokenUsage()
 
-    async def analyze_golden_quotes(self, messages: List[Dict]) -> Tuple[List[GoldenQuote], TokenUsage]:
+    async def analyze_golden_quotes(self, messages: List[Dict], umo: str = None) -> Tuple[List[GoldenQuote], TokenUsage]:
         """使用LLM分析群聊金句"""
         try:
             # 提取有趣的文本消息
@@ -519,12 +537,7 @@ class LLMAnalyzer:
 """
 
             # 调用LLM
-            provider = self.context.get_using_provider()
-            if not provider:
-                logger.warning("未配置LLM提供商，跳过金句分析")
-                return [], TokenUsage()
-
-            response = await self._call_provider_with_retry(provider, prompt, max_tokens=1500, temperature=0.7)
+            response = await self._call_provider_with_retry(None, prompt, max_tokens=1500, temperature=0.7, umo=umo)
             if response is None:
                 logger.error("金句分析调用LLM失败: provider返回None（重试失败）")
                 return [], TokenUsage()
